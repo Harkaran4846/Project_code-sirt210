@@ -1,0 +1,177 @@
+#include <Adafruit_Fingerprint.h>  // Library for handling fingerprint sensor
+#include <WiFi.h>  // Library for WiFi connectivity
+#include <PubSubClient.h>  // Library for MQTT communication
+
+// Replace with your network credentials
+const char* ssid = "Free";  // WiFi SSID
+const char* password = "12345678";  // WiFi password
+
+// MQTT Broker setup
+const char* mqtt_server = "broker.emqx.io";  // MQTT broker URL
+WiFiClient espClient;  // WiFi client for MQTT communication
+PubSubClient client(espClient);  // MQTT client instance
+
+// Fingerprint sensor connection
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&Serial1);  // Initialize the fingerprint sensor on Serial1
+
+// MQTT Topics
+const char* requestTopic = "attendance/request";  // Topic for requests from Raspberry Pi to activate fingerprint sensor
+const char* responseTopic = "attendance/response";  // Topic to send fingerprint results back to Raspberry Pi
+
+// Track if the fingerprint sensor is active
+bool fingerprintSensorActive = false;  // Flag to track if fingerprint sensor is active
+
+// Function to connect to WiFi
+void setup_wifi() {
+  Serial.begin(9600);  // Start the serial communication
+  while (!Serial);  // For boards like Yun/Leo/Micro/Zero, wait for serial connection
+  Serial.println();
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);  // Connect to WiFi using provided credentials
+  while (WiFi.status() != WL_CONNECTED) {  // Wait until connected
+    delay(1000);
+    Serial.print(".");  // Print dots until WiFi is connected
+  }
+  Serial.println("Connected to WiFi");  // Once connected, print success message
+}
+
+// MQTT callback function
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg = "";
+  // Convert the MQTT message payload to a string
+  for (int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+
+  // Check if the Raspberry Pi sent the request to activate fingerprint sensor
+  if (String(topic) == requestTopic) {
+    if (msg == "turn_on_fingerprint_sensor") {  // If the message is to turn on the sensor
+      Serial.println("Fingerprint sensor activated by Raspberry Pi");
+      fingerprintSensorActive = true;  // Set the flag to true, meaning the sensor is now active
+    }
+  }
+}
+
+// MQTT reconnect function
+void reconnect() {
+  while (!client.connected()) {  // Try to connect to the MQTT broker until successful
+    if (client.connect("ArduinoClient")) {  // Connect with a client ID
+      Serial.println("Connected to MQTT Broker");  // Print success message when connected
+      client.subscribe(requestTopic);  // Subscribe to the request topic to receive requests from Raspberry Pi
+    } else {
+      delay(5000);  // Wait 5 seconds before retrying if connection fails
+    }
+  }
+}
+
+void setup() {
+  // Initialize WiFi
+  setup_wifi();
+
+  // Set up the MQTT client
+  client.setServer(mqtt_server, 1883);  // Set the MQTT broker and port (default is 1883)
+  client.setCallback(mqttCallback);  // Set the callback function to handle incoming messages
+
+  // Set up the fingerprint sensor
+  finger.begin(57600);  // Initialize fingerprint sensor with baud rate of 57600
+  delay(5);  // Delay for sensor to initialize
+  if (finger.verifyPassword()) {  // Verify fingerprint sensor connection
+    Serial.println("Found fingerprint sensor!");  // If the sensor is found, print success message
+  } else {
+    Serial.println("Did not find fingerprint sensor :(");  // If sensor is not found, print error and halt
+    while (1) { delay(1); }  // Infinite loop to halt the program if sensor is not found
+  }
+
+  // Print sensor parameters like the number of stored templates
+  finger.getParameters();
+  Serial.print("Sensor contains "); Serial.print(finger.templateCount); Serial.println(" templates");
+}
+
+void loop() {
+  // Ensure MQTT connection is live
+  if (!client.connected()) {
+    reconnect();  // If not connected, try reconnecting
+  }
+  client.loop();  // Handle incoming MQTT messages
+
+  // Only check the fingerprint sensor if it's active
+  if (fingerprintSensorActive) {
+    uint8_t fingerID = getFingerprintID();  // Get the fingerprint ID if a valid fingerprint is detected
+    
+    // Only proceed if a valid fingerprint ID is returned (i.e., not 255 or -1)
+    if (fingerID >= 1 && fingerID <= 200) {  // Adjust the ID range based on your setup
+      Serial.print("Valid Fingerprint ID: ");
+      Serial.println(fingerID);  // Print the valid fingerprint ID
+      
+      // Send the detected fingerprint ID back to Raspberry Pi
+      String fingerprintIdString = String(fingerID);
+      client.publish(responseTopic, fingerprintIdString.c_str());  // Publish the fingerprint ID to the response topic
+      
+      // Reset the fingerprint sensor for next use
+      fingerprintSensorActive = false;  // Deactivate the fingerprint sensor after processing
+      Serial.println("Fingerprint sensor deactivated after sending ID.");
+    } else {
+      Serial.println("No valid fingerprint detected or ID is out of range.");  // If no valid fingerprint is detected
+    }
+  }
+
+  delay(500);  // Small delay to avoid excessive CPU usage
+}
+
+// Function to capture and process the fingerprint image and return the fingerprint ID
+uint8_t getFingerprintID() {
+  uint8_t p = finger.getImage();  // Capture a fingerprint image
+  switch (p) {
+    case FINGERPRINT_OK:  // If image capture is successful
+      Serial.println("Image taken");
+      break;
+    case FINGERPRINT_NOFINGER:  // No finger detected
+      return -1;  // Return -1 if no finger is placed
+    case FINGERPRINT_PACKETRECIEVEERR:  // Communication error
+      Serial.println("Communication error");
+      return -1;  // Return -1 in case of error
+    case FINGERPRINT_IMAGEFAIL:  // Image capture failed
+      Serial.println("Imaging error");
+      return -1;
+    default:  // Unknown error
+      Serial.println("Unknown error");
+      return -1;
+  }
+
+  // Image captured, now convert it to a template
+  p = finger.image2Tz();  // Convert the captured image into a template
+  switch (p) {
+    case FINGERPRINT_OK:  // If conversion is successful
+      Serial.println("Image converted");
+      break;
+    case FINGERPRINT_IMAGEMESS:  // Image is too messy to process
+      Serial.println("Image too messy");
+      return -1;
+    case FINGERPRINT_PACKETRECIEVEERR:  // Communication error
+      Serial.println("Communication error");
+      return -1;
+    case FINGERPRINT_FEATUREFAIL:  // Features not found in image
+      Serial.println("Could not find fingerprint features");
+      return -1;
+    case FINGERPRINT_INVALIDIMAGE:  // Invalid image
+      Serial.println("Invalid image");
+      return -1;
+    default:  // Unknown error
+      Serial.println("Unknown error");
+      return -1;
+  }
+
+  // Search the fingerprint database for a match
+  p = finger.fingerSearch();  // Search for a match in the fingerprint template database
+  if (p == FINGERPRINT_OK && finger.fingerID != 255) {  // If a match is found
+    Serial.println("Found a print match!");
+    return finger.fingerID;  // Return the matching fingerprint ID
+  } else if (p == FINGERPRINT_PACKETRECIEVEERR) {  // Communication error
+    Serial.println("Communication error");
+  } else if (p == FINGERPRINT_NOTFOUND) {  // No match found
+    Serial.println("Did not find a match");
+  } else {  // Unknown error
+    Serial.println("Unknown error");
+  }
+  return -1;  // Return -1 if no match is found or if there is an error
+}
